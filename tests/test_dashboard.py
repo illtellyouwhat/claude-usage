@@ -217,51 +217,64 @@ class TestHTMLTemplate(unittest.TestCase):
         """Verify getPricing returns null for non-Anthropic models."""
         self.assertIn("return null;", HTML_TEMPLATE)
 
-    def test_hourly_chart_canvas_present(self):
-        """Hourly distribution chart has a canvas + TZ toggle."""
-        self.assertIn('id="chart-hourly"', HTML_TEMPLATE)
-        self.assertIn('data-tz="local"', HTML_TEMPLATE)
-        self.assertIn('data-tz="utc"', HTML_TEMPLATE)
+    def test_accordion_project_section_present(self):
+        """Projects section uses accordion pattern."""
+        self.assertIn('accordion-header', HTML_TEMPLATE)
+        self.assertIn('accordion-body', HTML_TEMPLATE)
+        self.assertIn('toggleProject', HTML_TEMPLATE)
 
-    def test_hourly_peak_hour_constants(self):
-        """Peak-hour set covers UTC 12–17 (Mon–Fri 05:00–11:00 PT)."""
-        self.assertIn('PEAK_HOURS_UTC', HTML_TEMPLATE)
-        self.assertIn('[12, 13, 14, 15, 16, 17]', HTML_TEMPLATE)
+    def test_custom_date_range_inputs_present(self):
+        """Filter bar has custom start/end date pickers."""
+        self.assertIn('id="custom-start"', HTML_TEMPLATE)
+        self.assertIn('id="custom-end"', HTML_TEMPLATE)
+        self.assertIn('onCustomDate()', HTML_TEMPLATE)
 
 
 class TestPricingParity(unittest.TestCase):
-    """Verify CLI and dashboard pricing tables stay in sync."""
+    """Verify CLI and dashboard Python pricing tables stay in sync.
 
-    def _extract_js_pricing(self):
-        """Extract pricing values from the dashboard JS PRICING object."""
-        import re
-        prices = {}
-        for match in re.finditer(
-            r"'(claude-[^']+)':\s*\{\s*input:\s*([\d.]+),\s*output:\s*([\d.]+)",
-            HTML_TEMPLATE
-        ):
-            model, inp, out = match.group(1), float(match.group(2)), float(match.group(3))
-            prices[model] = {"input": inp, "output": out}
-        return prices
+    JS pricing is now loaded dynamically from /api/data (dashboard.DEFAULT_PRICING
+    merged with any rate overrides), so parity is checked at the Python level.
+    """
 
     def test_all_cli_models_in_dashboard(self):
         from cli import PRICING as CLI_PRICING
-        js_prices = self._extract_js_pricing()
+        from dashboard import DEFAULT_PRICING
         for model in CLI_PRICING:
-            self.assertIn(model, js_prices, f"{model} missing from dashboard JS")
+            self.assertIn(model, DEFAULT_PRICING, f"{model} missing from dashboard DEFAULT_PRICING")
 
     def test_prices_match(self):
         from cli import PRICING as CLI_PRICING
-        js_prices = self._extract_js_pricing()
+        from dashboard import DEFAULT_PRICING
         for model in CLI_PRICING:
             self.assertAlmostEqual(
-                CLI_PRICING[model]["input"], js_prices[model]["input"],
+                CLI_PRICING[model]["input"], DEFAULT_PRICING[model]["input"],
                 msg=f"{model} input price mismatch"
             )
             self.assertAlmostEqual(
-                CLI_PRICING[model]["output"], js_prices[model]["output"],
+                CLI_PRICING[model]["output"], DEFAULT_PRICING[model]["output"],
                 msg=f"{model} output price mismatch"
             )
+
+    def test_api_data_includes_pricing(self):
+        """Verify /api/data response includes pricing so JS can load it."""
+        import tempfile
+        from pathlib import Path
+        from scanner import get_db, init_db
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        db_path = Path(tmp.name)
+        conn = get_db(db_path)
+        init_db(conn)
+        conn.close()
+        try:
+            from dashboard import get_dashboard_data
+            data = get_dashboard_data(db_path=db_path)
+            self.assertIn("pricing", data)
+            self.assertIsInstance(data["pricing"], dict)
+            self.assertIn("claude-sonnet-4-6", data["pricing"])
+        finally:
+            os.unlink(db_path)
 
 
 if __name__ == "__main__":

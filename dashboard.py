@@ -10,6 +10,30 @@ from pathlib import Path
 from datetime import datetime
 
 DB_PATH = Path.home() / ".claude" / "usage.db"
+RATES_OVERRIDE_PATH = Path.home() / ".claude" / "claude_usage_rates.json"
+
+DEFAULT_PRICING = {
+    "claude-opus-4-7":   {"input": 5.00, "output": 25.00, "cache_write": 6.25, "cache_read": 0.50},
+    "claude-opus-4-6":   {"input": 5.00, "output": 25.00, "cache_write": 6.25, "cache_read": 0.50},
+    "claude-opus-4-5":   {"input": 5.00, "output": 25.00, "cache_write": 6.25, "cache_read": 0.50},
+    "claude-sonnet-4-7": {"input": 3.00, "output": 15.00, "cache_write": 3.75, "cache_read": 0.30},
+    "claude-sonnet-4-6": {"input": 3.00, "output": 15.00, "cache_write": 3.75, "cache_read": 0.30},
+    "claude-sonnet-4-5": {"input": 3.00, "output": 15.00, "cache_write": 3.75, "cache_read": 0.30},
+    "claude-haiku-4-7":  {"input": 1.00, "output":  5.00, "cache_write": 1.25, "cache_read": 0.10},
+    "claude-haiku-4-6":  {"input": 1.00, "output":  5.00, "cache_write": 1.25, "cache_read": 0.10},
+    "claude-haiku-4-5":  {"input": 1.00, "output":  5.00, "cache_write": 1.25, "cache_read": 0.10},
+}
+
+
+def load_pricing():
+    pricing = dict(DEFAULT_PRICING)
+    if RATES_OVERRIDE_PATH.exists():
+        try:
+            overrides = json.loads(RATES_OVERRIDE_PATH.read_text())
+            pricing.update(overrides)
+        except Exception:
+            pass
+    return pricing
 
 
 def get_dashboard_data(db_path=DB_PATH):
@@ -53,8 +77,7 @@ def get_dashboard_data(db_path=DB_PATH):
         "turns":          r["turns"] or 0,
     } for r in daily_rows]
 
-    # ── Hourly per-day per-model (client filters by range + TZ-shifts) ────────
-    # Timestamps are ISO8601 UTC (e.g. "2026-04-08T09:30:00Z"); chars 12-13 = hour.
+    # ── Hourly per-day per-model (kept for potential future use) ──────────────
     hourly_rows = conn.execute("""
         SELECT
             substr(timestamp, 1, 10)                  as day,
@@ -110,14 +133,47 @@ def get_dashboard_data(db_path=DB_PATH):
             "cache_creation": r["total_cache_creation"] or 0,
         })
 
+    # ── Per-project, per-model, per-day (from turns — accurate sub-agent routing) ─
+    # The sessions table has one model per session (typically Sonnet). The turns
+    # table has per-API-call attribution, so Haiku sub-agent calls show here.
+    proj_model_rows = conn.execute("""
+        SELECT
+            COALESCE(s.project_name, 'unknown') as project,
+            COALESCE(t.model, 'unknown')         as model,
+            substr(t.timestamp, 1, 10)           as day,
+            SUM(t.input_tokens)                  as input,
+            SUM(t.output_tokens)                 as output,
+            SUM(t.cache_read_tokens)             as cache_read,
+            SUM(t.cache_creation_tokens)         as cache_creation,
+            COUNT(*)                             as turns
+        FROM turns t
+        LEFT JOIN sessions s ON t.session_id = s.session_id
+        WHERE t.timestamp IS NOT NULL
+        GROUP BY s.project_name, t.model, day
+        ORDER BY s.project_name, day, t.model
+    """).fetchall()
+
+    project_daily_by_model = [{
+        "project":        r["project"],
+        "model":          r["model"],
+        "day":            r["day"],
+        "input":          r["input"] or 0,
+        "output":         r["output"] or 0,
+        "cache_read":     r["cache_read"] or 0,
+        "cache_creation": r["cache_creation"] or 0,
+        "turns":          r["turns"] or 0,
+    } for r in proj_model_rows]
+
     conn.close()
 
     return {
-        "all_models":      all_models,
-        "daily_by_model":  daily_by_model,
-        "hourly_by_model": hourly_by_model,
-        "sessions_all":    sessions_all,
-        "generated_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "all_models":             all_models,
+        "daily_by_model":         daily_by_model,
+        "hourly_by_model":        hourly_by_model,
+        "sessions_all":           sessions_all,
+        "project_daily_by_model": project_daily_by_model,
+        "generated_at":           datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "pricing":                load_pricing(),
     }
 
 
@@ -159,11 +215,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .model-cb-label input { display: none; }
   .filter-btn { padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; white-space: nowrap; }
   .filter-btn:hover { border-color: var(--accent); color: var(--text); }
+  .filter-btn.active { background: rgba(217,119,87,0.15); border-color: var(--accent); color: var(--accent); }
   .range-group { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; flex-shrink: 0; }
   .range-btn { padding: 4px 13px; background: transparent; border: none; border-right: 1px solid var(--border); color: var(--muted); font-size: 12px; cursor: pointer; transition: background 0.15s, color 0.15s; }
   .range-btn:last-child { border-right: none; }
   .range-btn:hover { background: rgba(255,255,255,0.04); color: var(--text); }
   .range-btn.active { background: rgba(217,119,87,0.15); color: var(--accent); font-weight: 600; }
+  input[type="date"] { background: var(--card); border: 1px solid var(--border); color: var(--text); padding: 3px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; }
+  input[type="date"]:focus { outline: none; border-color: var(--accent); }
 
   .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
   .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; margin-bottom: 24px; }
@@ -172,55 +231,51 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .stat-card .value { font-size: 22px; font-weight: 700; }
   .stat-card .sub { color: var(--muted); font-size: 11px; margin-top: 4px; }
 
-  .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
-  .chart-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
-  .chart-card.wide { grid-column: 1 / -1; }
-  .chart-card h2 { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 16px; }
-  .chart-wrap { position: relative; height: 240px; }
-  .chart-wrap.tall { height: 300px; }
-  .chart-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
-  .chart-header h2 { margin-bottom: 0; }
-  .chart-header-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .chart-day-count { font-size: 11px; color: var(--muted); }
-  .tz-group { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
-  .tz-btn { padding: 3px 10px; background: transparent; border: none; border-right: 1px solid var(--border); color: var(--muted); font-size: 11px; cursor: pointer; transition: background 0.15s, color 0.15s; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
-  .tz-btn:last-child { border-right: none; }
-  .tz-btn:hover { background: rgba(255,255,255,0.04); color: var(--text); }
-  .tz-btn.active { background: rgba(217,119,87,0.15); color: var(--accent); }
-  .peak-legend { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); }
-  .peak-swatch { width: 10px; height: 10px; background: rgba(248,113,113,0.8); border-radius: 2px; display: inline-block; }
+  /* Projects accordion */
+  #projects-section { margin-bottom: 24px; }
+  .section-heading { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }
+  .accordion { background: var(--card); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; overflow: hidden; }
+  .accordion-header { display: flex; align-items: center; gap: 12px; padding: 14px 20px; cursor: pointer; user-select: none; }
+  .accordion-header:hover { background: rgba(255,255,255,0.02); }
+  .accordion-arrow { color: var(--muted); font-size: 11px; flex-shrink: 0; width: 12px; }
+  .accordion-name { font-weight: 600; flex: 1 1 auto; }
+  .accordion-meta { color: var(--muted); font-size: 12px; flex-shrink: 0; }
+  .accordion-body { display: none; border-top: 1px solid var(--border); }
+  .accordion-body.open { display: block; }
+  .accordion-content { display: flex; align-items: flex-start; }
+  .sessions-table-wrap { flex: 1 1 auto; overflow-x: auto; padding: 16px; }
+  .donut-wrap { flex: 0 0 260px; padding: 16px; border-left: 1px solid var(--border); display: flex; flex-direction: column; align-items: center; }
+  .donut-title { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; }
 
   table { width: 100%; border-collapse: collapse; }
-  th { text-align: left; padding: 8px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); border-bottom: 1px solid var(--border); white-space: nowrap; }
-  th.sortable { cursor: pointer; user-select: none; }
-  th.sortable:hover { color: var(--text); }
-  .sort-icon { font-size: 9px; opacity: 0.8; }
-  td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  th { text-align: left; padding: 7px 10px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 12px; }
   tr:last-child td { border-bottom: none; }
   tr:hover td { background: rgba(255,255,255,0.02); }
-  .model-tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; background: rgba(79,142,247,0.15); color: var(--blue); }
+  .total-row td { border-top: 2px solid var(--border); border-bottom: none !important; font-weight: 600; }
+  .model-tag { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 10px; background: rgba(79,142,247,0.15); color: var(--blue); white-space: nowrap; max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
   .cost { color: var(--green); font-family: monospace; }
   .cost-na { color: var(--muted); font-family: monospace; font-size: 11px; }
   .num { font-family: monospace; }
   .muted { color: var(--muted); }
-  .section-title { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }
-  .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-  .section-header .section-title { margin-bottom: 0; }
-  .export-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 3px 10px; border-radius: 5px; cursor: pointer; font-size: 11px; }
-  .export-btn:hover { color: var(--text); border-color: var(--accent); }
-  .table-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; overflow-x: auto; }
+  .mono { font-family: monospace; }
 
-  footer { border-top: 1px solid var(--border); padding: 20px 24px; margin-top: 8px; }
+  /* Daily chart */
+  #daily-section { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
+  #daily-section h2 { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 16px; }
+  .chart-wrap { position: relative; height: 300px; }
+
+  footer { border-top: 1px solid var(--border); padding: 20px 24px; margin-top: 24px; }
   .footer-content { max-width: 1400px; margin: 0 auto; }
   .footer-content p { color: var(--muted); font-size: 12px; line-height: 1.7; margin-bottom: 4px; }
   .footer-content p:last-child { margin-bottom: 0; }
   .footer-content a { color: var(--blue); text-decoration: none; }
   .footer-content a:hover { text-decoration: underline; }
-
-  @media (max-width: 768px) { .charts-grid { grid-template-columns: 1fr; } .chart-card.wide { grid-column: 1; } }
+  code { font-family: monospace; font-size: 11px; background: rgba(255,255,255,0.06); padding: 1px 4px; border-radius: 3px; }
 </style>
 </head>
 <body>
+
 <header>
   <h1>Claude Code Usage Dashboard</h1>
   <div class="meta" id="meta">Loading...</div>
@@ -235,119 +290,36 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="filter-sep"></div>
   <div class="filter-label">Range</div>
   <div class="range-group">
-    <button class="range-btn" data-range="week" onclick="setRange('week')">This Week</button>
-    <button class="range-btn" data-range="month" onclick="setRange('month')">This Month</button>
+    <button class="range-btn" data-range="week"       onclick="setRange('week')">This Week</button>
+    <button class="range-btn" data-range="month"      onclick="setRange('month')">This Month</button>
     <button class="range-btn" data-range="prev-month" onclick="setRange('prev-month')">Prev Month</button>
-    <button class="range-btn" data-range="7d"  onclick="setRange('7d')">7d</button>
-    <button class="range-btn" data-range="30d" onclick="setRange('30d')">30d</button>
-    <button class="range-btn" data-range="90d" onclick="setRange('90d')">90d</button>
-    <button class="range-btn" data-range="all" onclick="setRange('all')">All</button>
+    <button class="range-btn" data-range="7d"         onclick="setRange('7d')">7d</button>
+    <button class="range-btn" data-range="30d"        onclick="setRange('30d')">30d</button>
+    <button class="range-btn" data-range="90d"        onclick="setRange('90d')">90d</button>
+    <button class="range-btn" data-range="all"        onclick="setRange('all')">All</button>
   </div>
+  <div class="filter-sep"></div>
+  <div class="filter-label">Custom</div>
+  <input type="date" id="custom-start" onchange="onCustomDate()">
+  <span style="color:var(--muted)">&#x2013;</span>
+  <input type="date" id="custom-end" onchange="onCustomDate()">
+  <div class="filter-sep"></div>
+  <button id="group-parent-btn" class="filter-btn" onclick="toggleGroupByParent()" title="Merge sub-directories under their parent (e.g. finance/advisor + finance/executor → finance)">Group paths</button>
 </div>
 
 <div class="container">
   <div class="stats-row" id="stats-row"></div>
-  <div class="charts-grid">
-    <div class="chart-card wide">
-      <h2 id="daily-chart-title">Daily Token Usage</h2>
-      <div class="chart-wrap tall"><canvas id="chart-daily"></canvas></div>
-    </div>
-    <div class="chart-card wide">
-      <div class="chart-header">
-        <h2 id="hourly-chart-title">Average Hourly Distribution</h2>
-        <div class="chart-header-right">
-          <span class="peak-legend" title="Mon–Fri 05:00–11:00 PT — Anthropic peak-hour throttling window"><span class="peak-swatch"></span>Peak hours (PT)</span>
-          <span class="chart-day-count" id="hourly-day-count"></span>
-          <div class="tz-group">
-            <button class="tz-btn" data-tz="local" onclick="setHourlyTZ('local')">Local</button>
-            <button class="tz-btn" data-tz="utc"   onclick="setHourlyTZ('utc')">UTC</button>
-          </div>
-        </div>
-      </div>
-      <div class="chart-wrap"><canvas id="chart-hourly"></canvas></div>
-    </div>
-    <div class="chart-card">
-      <h2>By Model</h2>
-      <div class="chart-wrap"><canvas id="chart-model"></canvas></div>
-    </div>
-    <div class="chart-card">
-      <h2>Top Projects by Tokens</h2>
-      <div class="chart-wrap"><canvas id="chart-project"></canvas></div>
-    </div>
-  </div>
-  <div class="table-card">
-    <div class="section-title">Cost by Model</div>
-    <table>
-      <thead><tr>
-        <th>Model</th>
-        <th class="sortable" onclick="setModelSort('turns')">Turns <span class="sort-icon" id="msort-turns"></span></th>
-        <th class="sortable" onclick="setModelSort('input')">Input <span class="sort-icon" id="msort-input"></span></th>
-        <th class="sortable" onclick="setModelSort('output')">Output <span class="sort-icon" id="msort-output"></span></th>
-        <th class="sortable" onclick="setModelSort('cache_read')">Cache Read <span class="sort-icon" id="msort-cache_read"></span></th>
-        <th class="sortable" onclick="setModelSort('cache_creation')">Cache Creation <span class="sort-icon" id="msort-cache_creation"></span></th>
-        <th class="sortable" onclick="setModelSort('cost')">Est. Cost <span class="sort-icon" id="msort-cost"></span></th>
-      </tr></thead>
-      <tbody id="model-cost-body"></tbody>
-    </table>
-  </div>
-  <div class="table-card">
-    <div class="section-header"><div class="section-title">Recent Sessions</div><button class="export-btn" onclick="exportSessionsCSV()" title="Export all filtered sessions to CSV">&#x2913; CSV</button></div>
-    <table>
-      <thead><tr>
-        <th>Session</th>
-        <th>Project</th>
-        <th class="sortable" onclick="setSessionSort('last')">Last Active <span class="sort-icon" id="sort-icon-last"></span></th>
-        <th class="sortable" onclick="setSessionSort('duration_min')">Duration <span class="sort-icon" id="sort-icon-duration_min"></span></th>
-        <th>Model</th>
-        <th class="sortable" onclick="setSessionSort('turns')">Turns <span class="sort-icon" id="sort-icon-turns"></span></th>
-        <th class="sortable" onclick="setSessionSort('input')">Input <span class="sort-icon" id="sort-icon-input"></span></th>
-        <th class="sortable" onclick="setSessionSort('output')">Output <span class="sort-icon" id="sort-icon-output"></span></th>
-        <th class="sortable" onclick="setSessionSort('cost')">Est. Cost <span class="sort-icon" id="sort-icon-cost"></span></th>
-      </tr></thead>
-      <tbody id="sessions-body"></tbody>
-    </table>
-  </div>
-  <div class="table-card">
-    <div class="section-header"><div class="section-title">Cost by Project</div><button class="export-btn" onclick="exportProjectsCSV()" title="Export all projects to CSV">&#x2913; CSV</button></div>
-    <table>
-      <thead><tr>
-        <th>Project</th>
-        <th class="sortable" onclick="setProjectSort('sessions')">Sessions <span class="sort-icon" id="psort-sessions"></span></th>
-        <th class="sortable" onclick="setProjectSort('turns')">Turns <span class="sort-icon" id="psort-turns"></span></th>
-        <th class="sortable" onclick="setProjectSort('input')">Input <span class="sort-icon" id="psort-input"></span></th>
-        <th class="sortable" onclick="setProjectSort('output')">Output <span class="sort-icon" id="psort-output"></span></th>
-        <th class="sortable" onclick="setProjectSort('cost')">Est. Cost <span class="sort-icon" id="psort-cost"></span></th>
-      </tr></thead>
-      <tbody id="project-cost-body"></tbody>
-    </table>
-  </div>
-  <div class="table-card">
-    <div class="section-header"><div class="section-title">Cost by Project &amp; Branch</div><button class="export-btn" onclick="exportProjectBranchCSV()" title="Export project+branch breakdown to CSV">&#x2913; CSV</button></div>
-    <table>
-      <thead><tr>
-        <th>Project</th>
-        <th>Branch</th>
-        <th class="sortable" onclick="setProjectBranchSort('sessions')">Sessions <span class="sort-icon" id="pbsort-sessions"></span></th>
-        <th class="sortable" onclick="setProjectBranchSort('turns')">Turns <span class="sort-icon" id="pbsort-turns"></span></th>
-        <th class="sortable" onclick="setProjectBranchSort('input')">Input <span class="sort-icon" id="pbsort-input"></span></th>
-        <th class="sortable" onclick="setProjectBranchSort('output')">Output <span class="sort-icon" id="pbsort-output"></span></th>
-        <th class="sortable" onclick="setProjectBranchSort('cost')">Est. Cost <span class="sort-icon" id="pbsort-cost"></span></th>
-      </tr></thead>
-      <tbody id="project-branch-cost-body"></tbody>
-    </table>
+  <div id="projects-section"></div>
+  <div id="daily-section">
+    <h2 id="daily-chart-title">Daily Token Usage</h2>
+    <div class="chart-wrap"><canvas id="chart-daily"></canvas></div>
   </div>
 </div>
 
 <footer>
   <div class="footer-content">
-    <p>Cost estimates based on Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>) as of April 2026. Only models containing <em>opus</em>, <em>sonnet</em>, or <em>haiku</em> in the name are included in cost calculations. Actual costs for Max/Pro subscribers differ from API pricing.</p>
-    <p>
-      GitHub: <a href="https://github.com/phuryn/claude-usage" target="_blank">https://github.com/phuryn/claude-usage</a>
-      &nbsp;&middot;&nbsp;
-      Created by: <a href="https://www.productcompass.pm" target="_blank">The Product Compass Newsletter</a>
-      &nbsp;&middot;&nbsp;
-      License: MIT
-    </p>
+    <p>Cost estimates based on Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>) as of April 2026. Override rates with <code>python cli.py set-rate</code>. Only models containing <em>opus</em>, <em>sonnet</em>, or <em>haiku</em> are included in cost calculations. Actual costs for Pro/Max subscribers differ from API pricing.</p>
+    <p>GitHub: <a href="https://github.com/phuryn/claude-usage" target="_blank">https://github.com/phuryn/claude-usage</a> &nbsp;&middot;&nbsp; License: MIT</p>
   </div>
 </footer>
 
@@ -360,76 +332,19 @@ function esc(s) {
 }
 
 // ── State ──────────────────────────────────────────────────────────────────
-let rawData = null;
+let rawData        = null;
+let PRICING        = {};
 let selectedModels = new Set();
-let selectedRange = '30d';
-let charts = {};
-let sessionSortCol = 'last';
-let modelSortCol = 'cost';
-let modelSortDir = 'desc';
-let projectSortCol = 'cost';
-let projectSortDir = 'desc';
-let branchSortCol = 'cost';
-let branchSortDir = 'desc';
-let lastFilteredSessions = [];
-let lastByProject = [];
-let lastByProjectBranch = [];
-let sessionSortDir = 'desc';
-let hourlyTZ = 'local';  // 'local' or 'utc'
+let selectedRange  = '30d';
+let customStart    = null;   // 'YYYY-MM-DD' or null
+let customEnd      = null;   // 'YYYY-MM-DD' or null
+let projectExpandState = {}; // project name -> bool
+let charts         = {};
+let lastByProject  = [];     // [{project, sessions[], cost}]
+let lastProjModelMap = {};   // project -> {model -> total tokens} (per-turn, not per-session)
+let groupByParent  = false;  // merge parent/leaf entries under parent
 
-// ── Peak-hour config ───────────────────────────────────────────────────────
-// Anthropic throttles Mon–Fri 05:00–11:00 PT. We approximate as fixed UTC hours
-// 12–17 (matches PDT; during PST the window shifts by 1h — accepted simplification).
-const PEAK_HOURS_UTC = new Set([12, 13, 14, 15, 16, 17]);
-
-// Local-timezone offset in hours (signed). Fractional offsets (e.g. India UTC+5:30)
-// are rounded to the nearest hour for bucket alignment.
-function localOffsetHours() {
-  return Math.round(-new Date().getTimezoneOffset() / 60);
-}
-
-// Return the UTC hour (0–23) corresponding to a displayed-hour bucket.
-function displayHourToUTC(displayHour, tzMode) {
-  if (tzMode === 'utc') return displayHour;
-  return ((displayHour - localOffsetHours()) % 24 + 24) % 24;
-}
-
-// Return the displayed-hour bucket for a UTC hour.
-function utcHourToDisplay(utcHour, tzMode) {
-  if (tzMode === 'utc') return utcHour;
-  return ((utcHour + localOffsetHours()) % 24 + 24) % 24;
-}
-
-function isPeakHour(displayHour, tzMode) {
-  return PEAK_HOURS_UTC.has(displayHourToUTC(displayHour, tzMode));
-}
-
-function formatHourLabel(h) {
-  return String(h).padStart(2, '0') + ':00';
-}
-
-function tzDisplayName(tzMode) {
-  if (tzMode === 'utc') return 'UTC';
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local';
-  } catch(e) {
-    return 'Local';
-  }
-}
-
-// ── Pricing (Anthropic API, April 2026) ────────────────────────────────────
-const PRICING = {
-  'claude-opus-4-7':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
-  'claude-opus-4-6':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
-  'claude-opus-4-5':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
-  'claude-sonnet-4-7': { input:  3.00, output: 15.00, cache_write:  3.75, cache_read: 0.30 },
-  'claude-sonnet-4-6': { input:  3.00, output: 15.00, cache_write:  3.75, cache_read: 0.30 },
-  'claude-sonnet-4-5': { input:  3.00, output: 15.00, cache_write:  3.75, cache_read: 0.30 },
-  'claude-haiku-4-7':  { input:  1.00, output:  5.00, cache_write:  1.25, cache_read: 0.10 },
-  'claude-haiku-4-6':  { input:  1.00, output:  5.00, cache_write:  1.25, cache_read: 0.10 },
-  'claude-haiku-4-5':  { input:  1.00, output:  5.00, cache_write:  1.25, cache_read: 0.10 },
-};
-
+// ── Pricing ────────────────────────────────────────────────────────────────
 function isBillable(model) {
   if (!model) return false;
   const m = model.toLowerCase();
@@ -437,7 +352,7 @@ function isBillable(model) {
 }
 
 function getPricing(model) {
-  if (!model) return null;
+  if (!model || !PRICING) return null;
   if (PRICING[model]) return PRICING[model];
   for (const key of Object.keys(PRICING)) {
     if (model.startsWith(key)) return PRICING[key];
@@ -481,16 +396,30 @@ const TOKEN_COLORS = {
 const MODEL_COLORS = ['#d97757','#4f8ef7','#4ade80','#a78bfa','#fbbf24','#f472b6','#34d399','#60a5fa'];
 
 // ── Time range ─────────────────────────────────────────────────────────────
-const RANGE_LABELS = { 'week': 'This Week', 'month': 'This Month', 'prev-month': 'Previous Month', '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time' };
-const RANGE_TICKS  = { 'week': 7, 'month': 15, 'prev-month': 15, '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
+const RANGE_LABELS = {
+  'week': 'This Week', 'month': 'This Month', 'prev-month': 'Previous Month',
+  '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time'
+};
 const VALID_RANGES = Object.keys(RANGE_LABELS);
 
-function rangeIncludesToday(range) {
-  if (range === 'all') return true;
-  const { start, end } = getRangeBounds(range);
+function getRangeLabel() {
+  if (customStart || customEnd) {
+    return (customStart || '…') + ' – ' + (customEnd || '…');
+  }
+  return RANGE_LABELS[selectedRange] || selectedRange;
+}
+
+function rangeIncludesToday() {
   const today = new Date().toISOString().slice(0, 10);
+  if (customStart || customEnd) {
+    if (customStart && today < customStart) return false;
+    if (customEnd   && today > customEnd)   return false;
+    return true;
+  }
+  if (selectedRange === 'all') return true;
+  const { start, end } = getRangeBounds(selectedRange);
   if (start && today < start) return false;
-  if (end && today > end) return false;
+  if (end   && today > end)   return false;
   return true;
 }
 
@@ -502,22 +431,21 @@ function getRangeBounds(range) {
     const day = today.getDay();
     const diffToMon = day === 0 ? 6 : day - 1;
     const mon = new Date(today); mon.setDate(today.getDate() - diffToMon);
-    const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
+    const sun = new Date(mon);   sun.setDate(mon.getDate() + 6);
     return { start: iso(mon), end: iso(sun) };
   }
   if (range === 'month') {
     const start = new Date(today.getFullYear(), today.getMonth(), 1);
-    const end = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+    const end   = new Date(today.getFullYear(), today.getMonth() + 1, 0);
     return { start: iso(start), end: iso(end) };
   }
   if (range === 'prev-month') {
     const start = new Date(today.getFullYear(), today.getMonth() - 1, 1);
-    const end = new Date(today.getFullYear(), today.getMonth(), 0);
+    const end   = new Date(today.getFullYear(), today.getMonth(), 0);
     return { start: iso(start), end: iso(end) };
   }
   const days = range === '7d' ? 7 : range === '30d' ? 30 : 90;
-  const d = new Date();
-  d.setDate(d.getDate() - days);
+  const d = new Date(); d.setDate(d.getDate() - days);
   return { start: iso(d), end: null };
 }
 
@@ -528,6 +456,10 @@ function readURLRange() {
 
 function setRange(range) {
   selectedRange = range;
+  customStart = null;
+  customEnd   = null;
+  document.getElementById('custom-start').value = '';
+  document.getElementById('custom-end').value   = '';
   document.querySelectorAll('.range-btn').forEach(btn =>
     btn.classList.toggle('active', btn.dataset.range === range)
   );
@@ -536,12 +468,14 @@ function setRange(range) {
   scheduleAutoRefresh();
 }
 
-function setHourlyTZ(mode) {
-  hourlyTZ = mode;
-  document.querySelectorAll('.tz-btn').forEach(btn =>
-    btn.classList.toggle('active', btn.dataset.tz === mode)
-  );
+function onCustomDate() {
+  customStart = document.getElementById('custom-start').value || null;
+  customEnd   = document.getElementById('custom-end').value   || null;
+  if (customStart || customEnd) {
+    document.querySelectorAll('.range-btn').forEach(btn => btn.classList.remove('active'));
+  }
   applyFilter();
+  scheduleAutoRefresh();
 }
 
 // ── Model filter ───────────────────────────────────────────────────────────
@@ -604,6 +538,21 @@ function clearAllModels() {
   updateURL(); applyFilter();
 }
 
+// ── Group-by-parent ────────────────────────────────────────────────────────
+function normalizedProject(name) {
+  if (!groupByParent) return name;
+  const slash = name.indexOf('/');
+  return slash >= 0 ? name.slice(0, slash) : name;
+}
+
+function toggleGroupByParent() {
+  groupByParent = !groupByParent;
+  projectExpandState = {};  // reset expand state — project keys change
+  const btn = document.getElementById('group-parent-btn');
+  if (btn) btn.classList.toggle('active', groupByParent);
+  applyFilter();
+}
+
 // ── URL persistence ────────────────────────────────────────────────────────
 function updateURL() {
   const allModels = Array.from(document.querySelectorAll('#model-checkboxes input')).map(cb => cb.value);
@@ -614,167 +563,81 @@ function updateURL() {
   history.replaceState(null, '', window.location.pathname + search);
 }
 
-// ── Session sort ───────────────────────────────────────────────────────────
-function setSessionSort(col) {
-  if (sessionSortCol === col) {
-    sessionSortDir = sessionSortDir === 'desc' ? 'asc' : 'desc';
-  } else {
-    sessionSortCol = col;
-    sessionSortDir = 'desc';
-  }
-  updateSortIcons();
-  applyFilter();
-}
-
-function updateSortIcons() {
-  document.querySelectorAll('.sort-icon').forEach(el => el.textContent = '');
-  const icon = document.getElementById('sort-icon-' + sessionSortCol);
-  if (icon) icon.textContent = sessionSortDir === 'desc' ? ' \u25bc' : ' \u25b2';
-}
-
-function sortSessions(sessions) {
-  return [...sessions].sort((a, b) => {
-    let av, bv;
-    if (sessionSortCol === 'cost') {
-      av = calcCost(a.model, a.input, a.output, a.cache_read, a.cache_creation);
-      bv = calcCost(b.model, b.input, b.output, b.cache_read, b.cache_creation);
-    } else if (sessionSortCol === 'duration_min') {
-      av = parseFloat(a.duration_min) || 0;
-      bv = parseFloat(b.duration_min) || 0;
-    } else {
-      av = a[sessionSortCol] ?? 0;
-      bv = b[sessionSortCol] ?? 0;
-    }
-    if (av < bv) return sessionSortDir === 'desc' ? 1 : -1;
-    if (av > bv) return sessionSortDir === 'desc' ? -1 : 1;
-    return 0;
-  });
-}
-
-// ── Aggregation & filtering ────────────────────────────────────────────────
+// ── Filter & aggregate ─────────────────────────────────────────────────────
 function applyFilter() {
   if (!rawData) return;
 
-  const { start, end } = getRangeBounds(selectedRange);
+  let start, end;
+  if (customStart || customEnd) {
+    start = customStart;
+    end   = customEnd;
+  } else {
+    const bounds = getRangeBounds(selectedRange);
+    start = bounds.start;
+    end   = bounds.end;
+  }
 
-  // Filter daily rows by model + date range
   const filteredDaily = rawData.daily_by_model.filter(r =>
     selectedModels.has(r.model) && (!start || r.day >= start) && (!end || r.day <= end)
   );
 
-  // Daily chart: aggregate by day
-  const dailyMap = {};
-  for (const r of filteredDaily) {
-    if (!dailyMap[r.day]) dailyMap[r.day] = { day: r.day, input: 0, output: 0, cache_read: 0, cache_creation: 0 };
-    const d = dailyMap[r.day];
-    d.input          += r.input;
-    d.output         += r.output;
-    d.cache_read     += r.cache_read;
-    d.cache_creation += r.cache_creation;
-  }
-  const daily = Object.values(dailyMap).sort((a, b) => a.day.localeCompare(b.day));
-
-  // By model: aggregate tokens + turns from daily data
-  const modelMap = {};
-  for (const r of filteredDaily) {
-    if (!modelMap[r.model]) modelMap[r.model] = { model: r.model, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0 };
-    const m = modelMap[r.model];
-    m.input          += r.input;
-    m.output         += r.output;
-    m.cache_read     += r.cache_read;
-    m.cache_creation += r.cache_creation;
-    m.turns          += r.turns;
-  }
-
-  // Filter sessions by model + date range
   const filteredSessions = rawData.sessions_all.filter(s =>
     selectedModels.has(s.model) && (!start || s.last_date >= start) && (!end || s.last_date <= end)
   );
 
-  // Add session counts into modelMap
-  for (const s of filteredSessions) {
-    if (modelMap[s.model]) modelMap[s.model].sessions++;
-  }
-
-  const byModel = Object.values(modelMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
-
-  // By project: aggregate from filtered sessions
+  // Group sessions by (normalized) project, sorted by cost desc
   const projMap = {};
   for (const s of filteredSessions) {
-    if (!projMap[s.project]) projMap[s.project] = { project: s.project, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0, cost: 0 };
-    const p = projMap[s.project];
-    p.input          += s.input;
-    p.output         += s.output;
-    p.cache_read     += s.cache_read;
-    p.cache_creation += s.cache_creation;
-    p.turns          += s.turns;
-    p.sessions++;
-    p.cost += calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+    const key = normalizedProject(s.project);
+    if (!projMap[key]) projMap[key] = { project: key, sessions: [], cost: 0 };
+    projMap[key].sessions.push(s);
+    projMap[key].cost += calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
   }
-  const byProject = Object.values(projMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
+  lastByProject = Object.values(projMap).sort((a, b) => b.cost - a.cost);
 
-  // By project+branch: aggregate from filtered sessions
-  const projBranchMap = {};
-  for (const s of filteredSessions) {
-    const key = s.project + '\x00' + (s.branch || '');
-    if (!projBranchMap[key]) projBranchMap[key] = { project: s.project, branch: s.branch || '', input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0, cost: 0 };
-    const pb = projBranchMap[key];
-    pb.input          += s.input;
-    pb.output         += s.output;
-    pb.cache_read     += s.cache_read;
-    pb.cache_creation += s.cache_creation;
-    pb.turns          += s.turns;
-    pb.sessions++;
-    pb.cost += calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+  // Build per-project, per-model token map from per-turn data (respects date + model filter).
+  // This captures sub-agent Haiku calls that the session-level model field misses.
+  lastProjModelMap = {};
+  for (const r of (rawData.project_daily_by_model || [])) {
+    if (!selectedModels.has(r.model)) continue;
+    if (start && r.day < start) continue;
+    if (end   && r.day > end)   continue;
+    const key = normalizedProject(r.project);
+    if (!lastProjModelMap[key]) lastProjModelMap[key] = {};
+    lastProjModelMap[key][r.model] =
+      (lastProjModelMap[key][r.model] || 0) + r.input + r.output;
   }
-  const byProjectBranch = Object.values(projBranchMap).sort((a, b) => b.cost - a.cost);
 
-  // Totals
+  // Totals from filtered sessions
   const totals = {
     sessions:       filteredSessions.length,
-    turns:          byModel.reduce((s, m) => s + m.turns, 0),
-    input:          byModel.reduce((s, m) => s + m.input, 0),
-    output:         byModel.reduce((s, m) => s + m.output, 0),
-    cache_read:     byModel.reduce((s, m) => s + m.cache_read, 0),
-    cache_creation: byModel.reduce((s, m) => s + m.cache_creation, 0),
-    cost:           byModel.reduce((s, m) => s + calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation), 0),
+    turns:          filteredSessions.reduce((acc, s) => acc + s.turns, 0),
+    input:          filteredSessions.reduce((acc, s) => acc + s.input, 0),
+    output:         filteredSessions.reduce((acc, s) => acc + s.output, 0),
+    cache_read:     filteredSessions.reduce((acc, s) => acc + s.cache_read, 0),
+    cache_creation: filteredSessions.reduce((acc, s) => acc + s.cache_creation, 0),
+    cost:           filteredSessions.reduce((acc, s) => acc + calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation), 0),
   };
 
-  // Hourly aggregation (filtered by model + range, then bucketed by UTC hour)
-  const hourlySrc = (rawData.hourly_by_model || []).filter(r =>
-    selectedModels.has(r.model) && (!cutoff || r.day >= cutoff)
-  );
-  const hourlyAgg = aggregateHourly(hourlySrc, hourlyTZ);
-
-  // Update daily chart title
-  document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + RANGE_LABELS[selectedRange];
-  document.getElementById('hourly-chart-title').textContent = 'Average Hourly Distribution \u2014 ' + RANGE_LABELS[selectedRange];
+  document.getElementById('daily-chart-title').textContent =
+    'Daily Token Usage — ' + getRangeLabel();
 
   renderStats(totals);
-  renderDailyChart(daily);
-  renderHourlyChart(hourlyAgg);
-  renderModelChart(byModel);
-  renderProjectChart(byProject);
-  lastFilteredSessions = sortSessions(filteredSessions);
-  lastByProject = sortProjects(byProject);
-  lastByProjectBranch = sortProjectBranch(byProjectBranch);
-  renderSessionsTable(lastFilteredSessions.slice(0, 20));
-  renderModelCostTable(byModel);
-  renderProjectCostTable(lastByProject.slice(0, 20));
-  renderProjectBranchCostTable(lastByProjectBranch.slice(0, 20));
+  renderProjects(lastByProject);
+  renderDailyChart(filteredDaily, start, end);
 }
 
 // ── Renderers ──────────────────────────────────────────────────────────────
 function renderStats(t) {
-  const rangeLabel = RANGE_LABELS[selectedRange].toLowerCase();
+  const sub = getRangeLabel().toLowerCase();
   const stats = [
-    { label: 'Sessions',       value: t.sessions.toLocaleString(), sub: rangeLabel },
-    { label: 'Turns',          value: fmt(t.turns),                sub: rangeLabel },
-    { label: 'Input Tokens',   value: fmt(t.input),                sub: rangeLabel },
-    { label: 'Output Tokens',  value: fmt(t.output),               sub: rangeLabel },
+    { label: 'Sessions',       value: t.sessions.toLocaleString(), sub },
+    { label: 'Turns',          value: fmt(t.turns),                sub },
+    { label: 'Input Tokens',   value: fmt(t.input),                sub },
+    { label: 'Output Tokens',  value: fmt(t.output),               sub },
     { label: 'Cache Read',     value: fmt(t.cache_read),           sub: 'from prompt cache' },
     { label: 'Cache Creation', value: fmt(t.cache_creation),       sub: 'writes to prompt cache' },
-    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, Apr 2026', color: '#4ade80' },
+    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing', color: '#4ade80' },
   ];
   document.getElementById('stats-row').innerHTML = stats.map(s => `
     <div class="stat-card">
@@ -785,70 +648,230 @@ function renderStats(t) {
   `).join('');
 }
 
-// Bucket rows into 24 hours (display-TZ), summing turns + output, and count
-// the unique days in the input so the caller can compute per-day averages.
-function aggregateHourly(rows, tzMode) {
-  const byHour = {};
-  for (let h = 0; h < 24; h++) byHour[h] = { turns: 0, output: 0 };
-  const days = new Set();
-  for (const r of rows) {
-    const displayHour = utcHourToDisplay(r.hour, tzMode);
-    byHour[displayHour].turns  += r.turns  || 0;
-    byHour[displayHour].output += r.output || 0;
-    if (r.day) days.add(r.day);
-  }
-  const dayCount = days.size;
-  const hours = [];
-  for (let h = 0; h < 24; h++) {
-    hours.push({
-      hour:       h,
-      avgTurns:   dayCount ? byHour[h].turns  / dayCount : 0,
-      avgOutput:  dayCount ? byHour[h].output / dayCount : 0,
-      totalTurns: byHour[h].turns,
-      peak:       isPeakHour(h, tzMode),
-    });
-  }
-  return { hours, dayCount };
+function renderProjectSessionsTable(sessions, groupKey) {
+  const sorted = [...sessions].sort((a, b) => b.last_date.localeCompare(a.last_date));
+  // Show 'Dir' column only when sessions span multiple sub-directories under the same parent
+  const subDirs = new Set(sorted.map(s => s.project));
+  const showDirCol = groupByParent && subDirs.size > 1;
+
+  const totals = sorted.reduce((acc, s) => {
+    acc.turns          += s.turns;
+    acc.input          += s.input;
+    acc.output         += s.output;
+    acc.cache_read     += s.cache_read;
+    acc.cache_creation += s.cache_creation;
+    acc.cost           += calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+    return acc;
+  }, { turns: 0, input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0 });
+
+  const rows = sorted.map(s => {
+    const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+    const costCell = isBillable(s.model)
+      ? `<td class="cost">${fmtCost(cost)}</td>`
+      : `<td class="cost-na">n/a</td>`;
+    const leaf = s.project.includes('/') ? s.project.split('/').pop() : s.project;
+    const dirCell = showDirCol ? `<td class="muted">${esc(leaf)}</td>` : '';
+    return `<tr>
+      <td class="muted mono">${esc(s.session_id)}&hellip;</td>
+      ${dirCell}
+      <td class="muted">${esc(s.last_date)}</td>
+      <td class="muted">${s.duration_min}m</td>
+      <td><span class="model-tag" title="${esc(s.model)}">${esc(s.model)}</span></td>
+      <td class="num">${s.turns}</td>
+      <td class="num">${fmt(s.input)}</td>
+      <td class="num">${fmt(s.output)}</td>
+      <td class="num">${fmt(s.cache_read)}</td>
+      <td class="num">${fmt(s.cache_creation)}</td>
+      ${costCell}
+    </tr>`;
+  }).join('');
+
+  const totalColspan = showDirCol ? 5 : 4;
+  const totalRow = `<tr class="total-row">
+    <td colspan="${totalColspan}" class="muted">Total</td>
+    <td class="num">${totals.turns}</td>
+    <td class="num">${fmt(totals.input)}</td>
+    <td class="num">${fmt(totals.output)}</td>
+    <td class="num">${fmt(totals.cache_read)}</td>
+    <td class="num">${fmt(totals.cache_creation)}</td>
+    <td class="cost">${fmtCost(totals.cost)}</td>
+  </tr>`;
+
+  const dirHeader = showDirCol ? '<th>Dir</th>' : '';
+  return `<table>
+    <thead><tr>
+      <th>Session</th>${dirHeader}<th>Date</th><th>Dur</th><th>Model</th>
+      <th>Turns</th><th>Input</th><th>Output</th>
+      <th>Cache Read</th><th>Cache Creation</th><th>Est. Cost</th>
+    </tr></thead>
+    <tbody>${rows}${totalRow}</tbody>
+  </table>`;
 }
 
-function renderHourlyChart(agg) {
-  const dayCountEl = document.getElementById('hourly-day-count');
-  dayCountEl.textContent = agg.dayCount
-    ? agg.dayCount + ' day' + (agg.dayCount === 1 ? '' : 's') + ' averaged · ' + tzDisplayName(hourlyTZ)
-    : 'No data · ' + tzDisplayName(hourlyTZ);
+function renderProjectDonut(id, modelTokens) {
+  const models = Object.keys(modelTokens).sort((a, b) => modelTokens[b] - modelTokens[a]);
+  if (!models.length) return;
 
-  const ctx = document.getElementById('chart-hourly').getContext('2d');
-  if (charts.hourly) charts.hourly.destroy();
+  const canvas = document.getElementById('donut-' + id);
+  if (!canvas) return;
+  const key = 'donut_' + id;
+  if (charts[key]) charts[key].destroy();
 
-  const labels = agg.hours.map(h => (h.peak ? '⚡ ' : '') + formatHourLabel(h.hour));
-  const turns  = agg.hours.map(h => h.avgTurns);
-  const output = agg.hours.map(h => h.avgOutput);
-  const barColors = agg.hours.map(h => h.peak ? 'rgba(248,113,113,0.8)' : TOKEN_COLORS.input);
-
-  charts.hourly = new Chart(ctx, {
+  charts[key] = new Chart(canvas.getContext('2d'), {
+    type: 'doughnut',
     data: {
-      labels: labels,
+      labels: models,
+      datasets: [{
+        data: models.map(m => modelTokens[m]),
+        backgroundColor: models.map((_, i) => MODEL_COLORS[i % MODEL_COLORS.length]),
+        borderWidth: 2,
+        borderColor: '#1a1d27',
+      }]
+    },
+    options: {
+      responsive: false,
+      plugins: {
+        legend: { position: 'bottom', labels: { color: '#8892a4', boxWidth: 12, font: { size: 11 } } },
+        tooltip: { callbacks: { label: ctx => ` ${ctx.label}: ${fmt(ctx.raw)} tokens` } },
+      }
+    }
+  });
+}
+
+function toggleProject(idx) {
+  const proj = lastByProject[idx];
+  if (!proj) return;
+  const project = proj.project;
+
+  const isNowOpen = !projectExpandState[project];
+  projectExpandState[project] = isNowOpen;
+
+  const body = document.getElementById('accordion-body-' + idx);
+  if (!body) return;
+  const arrow = body.previousElementSibling.querySelector('.accordion-arrow');
+
+  if (isNowOpen) {
+    body.classList.add('open');
+    if (arrow) arrow.textContent = '▼';
+    renderProjectDonut(String(idx), lastProjModelMap[proj.project] || {});
+  } else {
+    body.classList.remove('open');
+    if (arrow) arrow.textContent = '▶';
+    const key = 'donut_' + idx;
+    if (charts[key]) { charts[key].destroy(); delete charts[key]; }
+  }
+}
+
+function renderProjects(byProject) {
+  // Destroy all existing donut charts before rebuilding
+  for (const key of Object.keys(charts)) {
+    if (key.startsWith('donut_')) { charts[key].destroy(); delete charts[key]; }
+  }
+
+  const section = document.getElementById('projects-section');
+
+  if (!byProject.length) {
+    section.innerHTML = '<div style="color:var(--muted);padding:20px;background:var(--card);border:1px solid var(--border);border-radius:8px">No projects in this range.</div>';
+    return;
+  }
+
+  // Auto-expand top project on first render
+  if (Object.keys(projectExpandState).length === 0) {
+    projectExpandState[byProject[0].project] = true;
+  }
+
+  const parts = ['<div class="section-heading">Projects</div>'];
+
+  for (let idx = 0; idx < byProject.length; idx++) {
+    const p = byProject[idx];
+    const isOpen = !!projectExpandState[p.project];
+    const pTurns = p.sessions.reduce((sum, s) => sum + s.turns, 0);
+    const dates = p.sessions.map(s => s.last_date).filter(Boolean).sort();
+    const dateRange = dates.length === 0 ? '' :
+      dates[0] === dates[dates.length - 1] ? dates[0] :
+      dates[0] + '–' + dates[dates.length - 1];
+    const sessionWord = p.sessions.length === 1 ? 'session' : 'sessions';
+
+    parts.push(`
+      <div class="accordion">
+        <div class="accordion-header" onclick="toggleProject(${idx})">
+          <span class="accordion-arrow">${isOpen ? '▼' : '▶'}</span>
+          <span class="accordion-name">${esc(p.project)}</span>
+          <span class="accordion-meta">${p.sessions.length} ${sessionWord} &middot; ${pTurns.toLocaleString()} turns &middot; ${esc(dateRange)} &middot; <span class="cost">${fmtCost(p.cost)} est</span></span>
+        </div>
+        <div class="accordion-body ${isOpen ? 'open' : ''}" id="accordion-body-${idx}">
+          <div class="accordion-content">
+            <div class="sessions-table-wrap">${renderProjectSessionsTable(p.sessions, p.project)}</div>
+            <div class="donut-wrap">
+              <div class="donut-title">By Model</div>
+              <canvas id="donut-${idx}" width="228" height="228"></canvas>
+            </div>
+          </div>
+        </div>
+      </div>`);
+  }
+
+  section.innerHTML = parts.join('');
+
+  // Render donuts for all open projects
+  for (let idx = 0; idx < byProject.length; idx++) {
+    const p = byProject[idx];
+    if (projectExpandState[p.project]) {
+      renderProjectDonut(String(idx), lastProjModelMap[p.project] || {});
+    }
+  }
+}
+
+function renderDailyChart(filteredDaily, rangeStart, rangeEnd) {
+  // Aggregate by day (includes per-model cost)
+  const dailyMap = {};
+  for (const r of filteredDaily) {
+    if (!dailyMap[r.day]) dailyMap[r.day] = { day: r.day, input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0 };
+    const d = dailyMap[r.day];
+    d.input          += r.input;
+    d.output         += r.output;
+    d.cache_read     += r.cache_read;
+    d.cache_creation += r.cache_creation;
+    d.cost           += calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation);
+  }
+
+  const ctx = document.getElementById('chart-daily').getContext('2d');
+  if (charts.daily) { charts.daily.destroy(); charts.daily = null; }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const dataKeys = Object.keys(dailyMap).sort();
+
+  // Determine the date span to fill.
+  // Named ranges supply a start; "all" supplies null → span data to today.
+  let effectiveStart = rangeStart;
+  let effectiveEnd   = rangeEnd || today;
+  if (!effectiveStart) {
+    if (!dataKeys.length) return;
+    effectiveStart = dataKeys[0];   // oldest day with data
+  }
+
+  // Build a dense array covering every calendar day in the span.
+  const daily = [];
+  const cur     = new Date(effectiveStart + 'T12:00:00Z');
+  const endDate = new Date(effectiveEnd   + 'T12:00:00Z');
+  while (cur <= endDate) {
+    const dayStr = cur.toISOString().slice(0, 10);
+    daily.push(dailyMap[dayStr] || { day: dayStr, input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0 });
+    cur.setDate(cur.getDate() + 1);
+  }
+  if (!daily.length) return;
+
+  charts.daily = new Chart(ctx, {
+    data: {
+      labels: daily.map(d => d.day),
       datasets: [
-        {
-          type: 'bar',
-          label: 'Avg turns / hour',
-          data: turns,
-          backgroundColor: barColors,
-          yAxisID: 'y',
-          order: 2,
-        },
-        {
-          type: 'line',
-          label: 'Avg output tokens / hour',
-          data: output,
-          borderColor: TOKEN_COLORS.output,
-          backgroundColor: 'rgba(167,139,250,0.15)',
-          borderWidth: 2,
-          pointRadius: 2,
-          tension: 0.3,
-          yAxisID: 'y1',
-          order: 1,
-        },
+        { type: 'bar',  label: 'Input',          data: daily.map(d => d.input),          backgroundColor: TOKEN_COLORS.input,          stack: 'tokens', yAxisID: 'y' },
+        { type: 'bar',  label: 'Output',         data: daily.map(d => d.output),         backgroundColor: TOKEN_COLORS.output,         stack: 'tokens', yAxisID: 'y' },
+        { type: 'bar',  label: 'Cache Read',     data: daily.map(d => d.cache_read),     backgroundColor: TOKEN_COLORS.cache_read,     stack: 'tokens', yAxisID: 'y' },
+        { type: 'bar',  label: 'Cache Creation', data: daily.map(d => d.cache_creation), backgroundColor: TOKEN_COLORS.cache_creation, stack: 'tokens', yAxisID: 'y' },
+        { type: 'line', label: 'Est. Cost ($)',  data: daily.map(d => d.cost),
+          borderColor: '#4ade80', backgroundColor: 'transparent', borderWidth: 2,
+          pointRadius: 3, tension: 0, yAxisID: 'y1', showLine: true, pointStyle: 'circle' },
       ]
     },
     options: {
@@ -858,328 +881,41 @@ function renderHourlyChart(agg) {
         legend: { labels: { color: '#8892a4', boxWidth: 12 } },
         tooltip: {
           callbacks: {
-            title: (items) => {
-              if (!items.length) return '';
-              const idx = items[0].dataIndex;
-              const h = agg.hours[idx];
-              const base = formatHourLabel(h.hour) + ' ' + tzDisplayName(hourlyTZ);
-              return h.peak ? base + ' · Peak — Anthropic US hours' : base;
-            },
             label: (item) => {
-              if (item.dataset.label && item.dataset.label.indexOf('turns') !== -1) {
-                return ' Avg turns: ' + item.parsed.y.toFixed(2);
-              }
-              return ' Avg output: ' + fmt(item.parsed.y);
-            },
+              if (item.datasetIndex === 4) return ' Cost: $' + item.parsed.y.toFixed(4);
+              return ' ' + item.dataset.label + ': ' + fmt(item.parsed.y);
+            }
           }
-        },
+        }
       },
       scales: {
-        x: { ticks: { color: '#8892a4', maxRotation: 0, autoSkip: false, font: { size: 10 } }, grid: { color: '#2a2d3a' } },
-        y:  { position: 'left',  beginAtZero: true, ticks: { color: '#8892a4', callback: v => v.toFixed(1) },     grid: { color: '#2a2d3a' }, title: { display: true, text: 'Avg turns / hour',         color: '#8892a4', font: { size: 11 } } },
-        y1: { position: 'right', beginAtZero: true, ticks: { color: '#8892a4', callback: v => fmt(v) }, grid: { drawOnChartArea: false },   title: { display: true, text: 'Avg output tokens / hour', color: '#8892a4', font: { size: 11 } } },
+        x:  { ticks: { color: '#8892a4', maxTicksLimit: 15 }, grid: { color: '#2a2d3a' } },
+        y:  { position: 'left',  stacked: true, beginAtZero: true,
+              ticks: { color: '#4f8ef7', callback: v => fmt(v) }, grid: { color: '#2a2d3a' },
+              title: { display: true, text: 'Tokens', color: '#4f8ef7' } },
+        y1: { position: 'right', beginAtZero: true,
+              ticks: { color: '#4ade80', callback: v => '$' + v.toFixed(2) }, grid: { drawOnChartArea: false },
+              title: { display: true, text: 'Est. Cost ($)', color: '#4ade80' } },
       }
     }
   });
-}
-
-function renderDailyChart(daily) {
-  const ctx = document.getElementById('chart-daily').getContext('2d');
-  if (charts.daily) charts.daily.destroy();
-  charts.daily = new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels: daily.map(d => d.day),
-      datasets: [
-        { label: 'Input',          data: daily.map(d => d.input),          backgroundColor: TOKEN_COLORS.input,          stack: 'io',    yAxisID: 'y1' },
-        { label: 'Output',         data: daily.map(d => d.output),         backgroundColor: TOKEN_COLORS.output,         stack: 'io',    yAxisID: 'y1' },
-        { label: 'Cache Read',     data: daily.map(d => d.cache_read),     backgroundColor: TOKEN_COLORS.cache_read,     stack: 'cache', yAxisID: 'y' },
-        { label: 'Cache Creation', data: daily.map(d => d.cache_creation), backgroundColor: TOKEN_COLORS.cache_creation, stack: 'cache', yAxisID: 'y' },
-      ]
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { labels: { color: '#8892a4', boxWidth: 12 } } },
-      scales: {
-        x: { ticks: { color: '#8892a4', maxTicksLimit: RANGE_TICKS[selectedRange] }, grid: { color: '#2a2d3a' } },
-        y:  { position: 'left',  ticks: { color: '#74de80', callback: v => fmt(v) }, grid: { color: '#2a2d3a' }, title: { display: true, text: 'Cache', color: '#74de80' } },
-        y1: { position: 'right', ticks: { color: '#4f8ef7', callback: v => fmt(v) }, grid: { drawOnChartArea: false },    title: { display: true, text: 'Input / Output', color: '#4f8ef7' } },
-      }
-    }
-  });
-}
-
-function renderModelChart(byModel) {
-  const ctx = document.getElementById('chart-model').getContext('2d');
-  if (charts.model) charts.model.destroy();
-  if (!byModel.length) { charts.model = null; return; }
-  charts.model = new Chart(ctx, {
-    type: 'doughnut',
-    data: {
-      labels: byModel.map(m => m.model),
-      datasets: [{ data: byModel.map(m => m.input + m.output), backgroundColor: MODEL_COLORS, borderWidth: 2, borderColor: '#1a1d27' }]
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: {
-        legend: { position: 'bottom', labels: { color: '#8892a4', boxWidth: 12, font: { size: 11 } } },
-        tooltip: { callbacks: { label: ctx => ` ${ctx.label}: ${fmt(ctx.raw)} tokens` } }
-      }
-    }
-  });
-}
-
-function renderProjectChart(byProject) {
-  const top = byProject.slice(0, 10);
-  const ctx = document.getElementById('chart-project').getContext('2d');
-  if (charts.project) charts.project.destroy();
-  if (!top.length) { charts.project = null; return; }
-  charts.project = new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels: top.map(p => p.project.length > 22 ? '\u2026' + p.project.slice(-20) : p.project),
-      datasets: [
-        { label: 'Input',  data: top.map(p => p.input),  backgroundColor: TOKEN_COLORS.input },
-        { label: 'Output', data: top.map(p => p.output), backgroundColor: TOKEN_COLORS.output },
-      ]
-    },
-    options: {
-      indexAxis: 'y', responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { labels: { color: '#8892a4', boxWidth: 12 } } },
-      scales: {
-        x: { ticks: { color: '#8892a4', callback: v => fmt(v) }, grid: { color: '#2a2d3a' } },
-        y: { ticks: { color: '#8892a4', font: { size: 11 } }, grid: { color: '#2a2d3a' } },
-      }
-    }
-  });
-}
-
-function renderSessionsTable(sessions) {
-  document.getElementById('sessions-body').innerHTML = sessions.map(s => {
-    const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
-    const costCell = isBillable(s.model)
-      ? `<td class="cost">${fmtCost(cost)}</td>`
-      : `<td class="cost-na">n/a</td>`;
-    return `<tr>
-      <td class="muted" style="font-family:monospace">${esc(s.session_id)}&hellip;</td>
-      <td>${esc(s.project)}</td>
-      <td class="muted">${esc(s.last)}</td>
-      <td class="muted">${esc(s.duration_min)}m</td>
-      <td><span class="model-tag">${esc(s.model)}</span></td>
-      <td class="num">${s.turns}</td>
-      <td class="num">${fmt(s.input)}</td>
-      <td class="num">${fmt(s.output)}</td>
-      ${costCell}
-    </tr>`;
-  }).join('');
-}
-
-function setModelSort(col) {
-  if (modelSortCol === col) {
-    modelSortDir = modelSortDir === 'desc' ? 'asc' : 'desc';
-  } else {
-    modelSortCol = col;
-    modelSortDir = 'desc';
-  }
-  updateModelSortIcons();
-  applyFilter();
-}
-
-function updateModelSortIcons() {
-  document.querySelectorAll('[id^="msort-"]').forEach(el => el.textContent = '');
-  const icon = document.getElementById('msort-' + modelSortCol);
-  if (icon) icon.textContent = modelSortDir === 'desc' ? ' \u25bc' : ' \u25b2';
-}
-
-function sortModels(byModel) {
-  return [...byModel].sort((a, b) => {
-    let av, bv;
-    if (modelSortCol === 'cost') {
-      av = calcCost(a.model, a.input, a.output, a.cache_read, a.cache_creation);
-      bv = calcCost(b.model, b.input, b.output, b.cache_read, b.cache_creation);
-    } else {
-      av = a[modelSortCol] ?? 0;
-      bv = b[modelSortCol] ?? 0;
-    }
-    if (av < bv) return modelSortDir === 'desc' ? 1 : -1;
-    if (av > bv) return modelSortDir === 'desc' ? -1 : 1;
-    return 0;
-  });
-}
-
-function renderModelCostTable(byModel) {
-  document.getElementById('model-cost-body').innerHTML = sortModels(byModel).map(m => {
-    const cost = calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation);
-    const costCell = isBillable(m.model)
-      ? `<td class="cost">${fmtCost(cost)}</td>`
-      : `<td class="cost-na">n/a</td>`;
-    return `<tr>
-      <td><span class="model-tag">${esc(m.model)}</span></td>
-      <td class="num">${fmt(m.turns)}</td>
-      <td class="num">${fmt(m.input)}</td>
-      <td class="num">${fmt(m.output)}</td>
-      <td class="num">${fmt(m.cache_read)}</td>
-      <td class="num">${fmt(m.cache_creation)}</td>
-      ${costCell}
-    </tr>`;
-  }).join('');
-}
-
-// ── Project cost table sorting ────────────────────────────────────────────
-function setProjectSort(col) {
-  if (projectSortCol === col) {
-    projectSortDir = projectSortDir === 'desc' ? 'asc' : 'desc';
-  } else {
-    projectSortCol = col;
-    projectSortDir = 'desc';
-  }
-  updateProjectSortIcons();
-  applyFilter();
-}
-
-function updateProjectSortIcons() {
-  document.querySelectorAll('[id^="psort-"]').forEach(el => el.textContent = '');
-  const icon = document.getElementById('psort-' + projectSortCol);
-  if (icon) icon.textContent = projectSortDir === 'desc' ? ' \u25bc' : ' \u25b2';
-}
-
-function sortProjects(byProject) {
-  return [...byProject].sort((a, b) => {
-    const av = a[projectSortCol] ?? 0;
-    const bv = b[projectSortCol] ?? 0;
-    if (av < bv) return projectSortDir === 'desc' ? 1 : -1;
-    if (av > bv) return projectSortDir === 'desc' ? -1 : 1;
-    return 0;
-  });
-}
-
-function renderProjectCostTable(byProject) {
-  document.getElementById('project-cost-body').innerHTML = sortProjects(byProject).map(p => {
-    return `<tr>
-      <td>${esc(p.project)}</td>
-      <td class="num">${p.sessions}</td>
-      <td class="num">${fmt(p.turns)}</td>
-      <td class="num">${fmt(p.input)}</td>
-      <td class="num">${fmt(p.output)}</td>
-      <td class="cost">${fmtCost(p.cost)}</td>
-    </tr>`;
-  }).join('');
-}
-
-// ── Project+Branch cost table sorting ────────────────────────────────────
-function setProjectBranchSort(col) {
-  if (branchSortCol === col) {
-    branchSortDir = branchSortDir === 'desc' ? 'asc' : 'desc';
-  } else {
-    branchSortCol = col;
-    branchSortDir = 'desc';
-  }
-  updateProjectBranchSortIcons();
-  applyFilter();
-}
-
-function updateProjectBranchSortIcons() {
-  document.querySelectorAll('[id^="pbsort-"]').forEach(el => el.textContent = '');
-  const icon = document.getElementById('pbsort-' + branchSortCol);
-  if (icon) icon.textContent = branchSortDir === 'desc' ? ' \u25bc' : ' \u25b2';
-}
-
-function sortProjectBranch(rows) {
-  return [...rows].sort((a, b) => {
-    const pa = (a.project || '').toLowerCase();
-    const pb = (b.project || '').toLowerCase();
-    if (pa < pb) return -1;
-    if (pa > pb) return 1;
-    const av = a[branchSortCol] ?? 0;
-    const bv = b[branchSortCol] ?? 0;
-    if (av < bv) return branchSortDir === 'desc' ? 1 : -1;
-    if (av > bv) return branchSortDir === 'desc' ? -1 : 1;
-    return 0;
-  });
-}
-
-function renderProjectBranchCostTable(rows) {
-  document.getElementById('project-branch-cost-body').innerHTML = sortProjectBranch(rows).map(pb => {
-    return `<tr>
-      <td>${esc(pb.project)}</td>
-      <td class="muted" style="font-family:monospace">${esc(pb.branch || '\u2014')}</td>
-      <td class="num">${pb.sessions}</td>
-      <td class="num">${fmt(pb.turns)}</td>
-      <td class="num">${fmt(pb.input)}</td>
-      <td class="num">${fmt(pb.output)}</td>
-      <td class="cost">${fmtCost(pb.cost)}</td>
-    </tr>`;
-  }).join('');
-}
-
-// ── CSV Export ────────────────────────────────────────────────────────────
-function csvField(val) {
-  const s = String(val);
-  if (s.includes(',') || s.includes('"') || s.includes('\n')) {
-    return '"' + s.replace(/"/g, '""') + '"';
-  }
-  return s;
-}
-
-function csvTimestamp() {
-  const d = new Date();
-  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0')
-    + '_' + String(d.getHours()).padStart(2,'0') + String(d.getMinutes()).padStart(2,'0');
-}
-
-function downloadCSV(reportType, header, rows) {
-  const lines = [header.map(csvField).join(',')];
-  for (const row of rows) {
-    lines.push(row.map(csvField).join(','));
-  }
-  const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = reportType + '_' + csvTimestamp() + '.csv';
-  a.click();
-  URL.revokeObjectURL(a.href);
-}
-
-function exportSessionsCSV() {
-  const header = ['Session', 'Project', 'Last Active', 'Duration (min)', 'Model', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
-  const rows = lastFilteredSessions.map(s => {
-    const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
-    return [s.session_id, s.project, s.last, s.duration_min, s.model, s.turns, s.input, s.output, s.cache_read, s.cache_creation, cost.toFixed(4)];
-  });
-  downloadCSV('sessions', header, rows);
-}
-
-function exportProjectsCSV() {
-  const header = ['Project', 'Sessions', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
-  const rows = lastByProject.map(p => {
-    return [p.project, p.sessions, p.turns, p.input, p.output, p.cache_read, p.cache_creation, p.cost.toFixed(4)];
-  });
-  downloadCSV('projects', header, rows);
-}
-
-function exportProjectBranchCSV() {
-  const header = ['Project', 'Branch', 'Sessions', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
-  const rows = lastByProjectBranch.map(pb => {
-    return [pb.project, pb.branch, pb.sessions, pb.turns, pb.input, pb.output, pb.cache_read, pb.cache_creation, pb.cost.toFixed(4)];
-  });
-  downloadCSV('projects_by_branch', header, rows);
 }
 
 // ── Rescan ────────────────────────────────────────────────────────────────
 async function triggerRescan() {
   const btn = document.getElementById('rescan-btn');
   btn.disabled = true;
-  btn.textContent = '\u21bb Scanning...';
+  btn.textContent = '↻ Scanning...';
   try {
     const resp = await fetch('/api/rescan', { method: 'POST' });
     const d = await resp.json();
-    btn.textContent = '\u21bb Rescan (' + d.new + ' new, ' + d.updated + ' updated)';
+    btn.textContent = '↻ Rescan (' + d.new + ' new, ' + d.updated + ' updated)';
     await loadData();
   } catch(e) {
-    btn.textContent = '\u21bb Rescan (error)';
+    btn.textContent = '↻ Rescan (error)';
     console.error(e);
   }
-  setTimeout(() => { btn.textContent = '\u21bb Rescan'; btn.disabled = false; }, 3000);
+  setTimeout(() => { btn.textContent = '↻ Rescan'; btn.disabled = false; }, 3000);
 }
 
 // ── Data loading ───────────────────────────────────────────────────────────
@@ -1191,29 +927,21 @@ async function loadData() {
       document.body.innerHTML = '<div style="padding:40px;color:#f87171">' + esc(d.error) + '</div>';
       return;
     }
-    const refreshNote = rangeIncludesToday(selectedRange) ? ' \u00b7 Auto-refresh in 30s' : '';
-    document.getElementById('meta').textContent = 'Updated: ' + d.generated_at + refreshNote;
 
     const isFirstLoad = rawData === null;
-    rawData = d;
+    rawData  = d;
+    PRICING  = d.pricing || {};
 
     if (isFirstLoad) {
-      // Restore range from URL, mark active button
       selectedRange = readURLRange();
       document.querySelectorAll('.range-btn').forEach(btn =>
         btn.classList.toggle('active', btn.dataset.range === selectedRange)
       );
-      // Mark default TZ button active
-      document.querySelectorAll('.tz-btn').forEach(btn =>
-        btn.classList.toggle('active', btn.dataset.tz === hourlyTZ)
-      );
-      // Build model filter (reads URL for model selection too)
       buildFilterUI(d.all_models);
-      updateSortIcons();
-      updateModelSortIcons();
-      updateProjectSortIcons();
-      updateProjectBranchSortIcons();
     }
+
+    const refreshNote = rangeIncludesToday() ? ' · Auto-refresh in 30s' : '';
+    document.getElementById('meta').textContent = 'Updated: ' + d.generated_at + refreshNote;
 
     applyFilter();
   } catch(e) {
@@ -1224,7 +952,7 @@ async function loadData() {
 let autoRefreshTimer = null;
 function scheduleAutoRefresh() {
   if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
-  if (rangeIncludesToday(selectedRange)) {
+  if (rangeIncludesToday()) {
     autoRefreshTimer = setInterval(loadData, 30000);
   }
 }
@@ -1297,7 +1025,3 @@ def serve(host=None, port=None):
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
-
-
-if __name__ == "__main__":
-    serve()

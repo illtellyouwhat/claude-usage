@@ -79,6 +79,12 @@ HOST=0.0.0.0 PORT=9000 python cli.py dashboard
 
 # Scan a custom projects directory
 python cli.py scan --projects-dir /path/to/transcripts
+
+# Show current effective pricing rates (defaults + any overrides)
+python cli.py rates
+
+# Override pricing for a specific model ($ per 1M tokens)
+python cli.py set-rate --model claude-sonnet-4-6 --input 3.00 --output 15.00 --cache-read 0.30 --cache-write 3.75
 ```
 
 The scanner is incremental — it tracks each file's path and modification time, so re-running `scan` is fast and only processes new or changed files.
@@ -125,4 +131,4 @@ Costs are calculated using **Anthropic API pricing as of April 2026** ([claude.c
 |------|---------|
 | `scanner.py` | Parses JSONL transcripts, writes to `~/.claude/usage.db` |
 | `dashboard.py` | HTTP server + single-page HTML/JS dashboard |
-| `cli.py` | `scan`, `today`, `stats`, `dashboard` commands |
+| `cli.py` | `scan`, `today`, `week`, `stats`, `dashboard`, `rates`, `set-rate` commands |

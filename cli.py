@@ -8,6 +8,7 @@ Commands:
   dashboard - Scan + open browser + start dashboard server
 """
 
+import json
 import os
 import sys
 import sqlite3
@@ -15,6 +16,7 @@ from pathlib import Path
 from datetime import datetime, date, timedelta
 
 DB_PATH = Path.home() / ".claude" / "usage.db"
+RATES_OVERRIDE_PATH = Path.home() / ".claude" / "claude_usage_rates.json"
 
 PRICING = {
     "claude-opus-4-7":   {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
@@ -357,6 +359,45 @@ def cmd_stats():
     conn.close()
 
 
+def cmd_rates():
+    """Print current effective pricing (defaults merged with any overrides)."""
+    overrides = {}
+    if RATES_OVERRIDE_PATH.exists():
+        try:
+            overrides = json.loads(RATES_OVERRIDE_PATH.read_text())
+        except Exception:
+            pass
+    print("\nCurrent effective rates ($ per 1M tokens):")
+    hr()
+    effective = dict(PRICING)
+    effective.update(overrides)
+    for model, rates in sorted(effective.items()):
+        tag = " [overridden]" if model in overrides else ""
+        print(f"  {model:<28}  in={rates['input']:.2f}  out={rates['output']:.2f}  "
+              f"cache_read={rates['cache_read']:.2f}  cache_write={rates['cache_write']:.2f}{tag}")
+    hr()
+    print()
+
+
+def cmd_set_rate(model, input_rate, output_rate, cache_read_rate, cache_write_rate):
+    """Write a rate override for one model to the override file."""
+    overrides = {}
+    if RATES_OVERRIDE_PATH.exists():
+        try:
+            overrides = json.loads(RATES_OVERRIDE_PATH.read_text())
+        except Exception:
+            pass
+    overrides[model] = {
+        "input":       float(input_rate),
+        "output":      float(output_rate),
+        "cache_read":  float(cache_read_rate),
+        "cache_write": float(cache_write_rate),
+    }
+    RATES_OVERRIDE_PATH.write_text(json.dumps(overrides, indent=2))
+    print(f"Rate override saved for {model}:")
+    print(f"  input={input_rate}  output={output_rate}  cache_read={cache_read_rate}  cache_write={cache_write_rate}")
+
+
 def cmd_dashboard(projects_dir=None, host=None, port=None):
     import webbrowser
     import threading
@@ -392,14 +433,19 @@ Usage:
   python cli.py stats                        Show all-time statistics
   python cli.py dashboard [--projects-dir PATH] [--host HOST] [--port PORT]
                                                  Scan + start dashboard
+  python cli.py rates                        Show current effective pricing rates
+  python cli.py set-rate --model MODEL --input N --output N --cache-read N --cache-write N
+                                                 Override pricing for one model ($ per 1M tokens)
 """
 
 COMMANDS = {
-    "scan": cmd_scan,
-    "today": cmd_today,
-    "week": cmd_week,
-    "stats": cmd_stats,
+    "scan":      cmd_scan,
+    "today":     cmd_today,
+    "week":      cmd_week,
+    "stats":     cmd_stats,
     "dashboard": cmd_dashboard,
+    "rates":     cmd_rates,
+    "set-rate":  cmd_set_rate,
 }
 
 def parse_named_arg(args, flag):
@@ -426,5 +472,15 @@ if __name__ == "__main__":
         )
     elif command == "scan" and projects_dir:
         cmd_scan(projects_dir=projects_dir)
+    elif command == "set-rate":
+        model = parse_named_arg(rest, "--model")
+        input_rate = parse_named_arg(rest, "--input")
+        output_rate = parse_named_arg(rest, "--output")
+        cache_read_rate = parse_named_arg(rest, "--cache-read")
+        cache_write_rate = parse_named_arg(rest, "--cache-write")
+        if not all([model, input_rate, output_rate, cache_read_rate, cache_write_rate]):
+            print("Usage: python cli.py set-rate --model MODEL --input N --output N --cache-read N --cache-write N")
+            sys.exit(1)
+        cmd_set_rate(model, input_rate, output_rate, cache_read_rate, cache_write_rate)
     else:
         COMMANDS[command]()
